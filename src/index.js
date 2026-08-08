@@ -19,8 +19,7 @@ import { configureCloudinary } from './config/cloudinary.js';
 
 const PORT = parseInt(process.env.PORT || '5000', 10);
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/pulsechat';
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
-const ALLOWED_ORIGINS = CORS_ORIGIN.split(',').map((origin) => origin.trim());
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
 
 const app = express();
 const httpServer = createServer(app);
@@ -31,7 +30,7 @@ app.use(
   cors({
     origin(origin, callback) {
       console.log("origin --------------------", origin)
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      if (!origin || origin === ALLOWED_ORIGIN) return callback(null, true);
       return callback(new Error('Origin is not allowed'));
     },
     credentials: true,
