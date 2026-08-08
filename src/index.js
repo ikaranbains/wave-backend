@@ -56,9 +56,9 @@ app.use('/api/push', pushRoutes);
 app.use('/api', chatRoutes);
 
 // Health Check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'Wave Express Backend', time: new Date() });
-});
+app.get("/", (req,res) => {
+  res.send("Wave backend production")
+})
 
 // Socket.IO Server Setup
 const io = new SocketIOServer(httpServer, {
