@@ -9,7 +9,10 @@ import {
   verifyAccessToken,
 } from '../middleware/authMiddleware.js';
 import { randomUUID } from 'crypto';
-import { createAndBroadcastMessage } from '../services/messageService.js';
+import {
+  createAndBroadcastMessage,
+  createCallEventMessage,
+} from '../services/messageService.js';
 
 const activeCalls = new Map();
 const CALL_RING_TIMEOUT = 60_000;
@@ -24,6 +27,26 @@ function clearCall(callId) {
   const call = activeCalls.get(callId);
   if (call?.timeout) clearTimeout(call.timeout);
   activeCalls.delete(callId);
+}
+
+/**
+ * Write the call into the conversation. `logged` guards against double entries
+ * when a hang-up races the ring/duration timeout.
+ */
+function logCall(io, call, outcome) {
+  if (!call || call.logged) return;
+  call.logged = true;
+
+  const durationSeconds = call.acceptedAt
+    ? (Date.now() - call.acceptedAt) / 1000
+    : 0;
+
+  createCallEventMessage({
+    io,
+    conversationId: call.conversationId,
+    callerId: call.callerId,
+    callEvent: { type: call.type, outcome, durationSeconds },
+  });
 }
 
 export function setupSocketIO(io) {
@@ -228,6 +251,7 @@ export function setupSocketIO(io) {
             callId,
             reason: 'missed',
           });
+          logCall(io, call, 'missed');
           clearCall(callId);
         }, CALL_RING_TIMEOUT);
         activeCalls.set(callId, call);
@@ -268,12 +292,14 @@ export function setupSocketIO(io) {
       }
 
       call.status = 'accepted';
+      call.acceptedAt = Date.now();
       if (call.timeout) clearTimeout(call.timeout);
       call.timeout = setTimeout(() => {
         emitToCallParticipants(io, call, 'call_ended', {
           callId,
           reason: 'timeout',
         });
+        logCall(io, call, 'completed');
         clearCall(callId);
       }, 2 * 60 * 60 * 1000);
       emitToCallParticipants(io, call, 'call_accepted', {
@@ -296,6 +322,7 @@ export function setupSocketIO(io) {
         callId,
         declinedBy: authenticatedUserId,
       });
+      logCall(io, call, 'declined');
       clearCall(callId);
       acknowledge?.({ ok: true });
     });
@@ -312,6 +339,7 @@ export function setupSocketIO(io) {
         endedBy: authenticatedUserId,
         reason: 'ended',
       });
+      logCall(io, call, call.status === 'accepted' ? 'completed' : 'cancelled');
       clearCall(callId);
       acknowledge?.({ ok: true });
     });
@@ -341,6 +369,27 @@ export function setupSocketIO(io) {
         }
       );
       io.emit('presence_change', { userId: authenticatedUserId, status: 'offline' });
+
+      // Without this, a dropped connection leaves the call in `activeCalls`
+      // until its timeout — up to two hours — during which `hasBusyParticipant`
+      // rejects every new call to either party with "already on a call".
+      const stillConnected = io.sockets.adapter.rooms.get(
+        `user:${authenticatedUserId}`
+      );
+      if (!stillConnected || stillConnected.size === 0) {
+        [...activeCalls.values()]
+          .filter((call) => call.participantIds.includes(authenticatedUserId))
+          .forEach((call) => {
+            emitToCallParticipants(io, call, 'call_ended', {
+              callId: call.callId,
+              endedBy: authenticatedUserId,
+              reason: 'disconnected',
+            });
+            logCall(io, call, call.status === 'accepted' ? 'completed' : 'cancelled');
+            clearCall(call.callId);
+          });
+      }
+
       console.log(`🔌 Socket client disconnected: ${socket.id}`);
     });
   });

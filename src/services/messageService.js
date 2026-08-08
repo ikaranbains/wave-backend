@@ -113,6 +113,74 @@ async function notifyOfflineParticipants({ io, conversation, senderId, message }
   );
 }
 
+function formatCallDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.round(totalSeconds || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  const pad = (value) => String(value).padStart(2, '0');
+  return hours > 0
+    ? `${hours}:${pad(minutes)}:${pad(secs)}`
+    : `${minutes}:${pad(secs)}`;
+}
+
+/** Preview text for the conversation list — the client renders its own label. */
+export function getCallEventSummary({ type, outcome, durationSeconds }) {
+  const kind = type === 'video' ? 'Video call' : 'Voice call';
+  if (outcome === 'completed') return `${kind} · ${formatCallDuration(durationSeconds)}`;
+  if (outcome === 'missed') return `Missed ${kind.toLowerCase()}`;
+  if (outcome === 'declined') return `Declined ${kind.toLowerCase()}`;
+  return `Cancelled ${kind.toLowerCase()}`;
+}
+
+/**
+ * Record a finished call as a message in the thread, the way WhatsApp does.
+ * Persisted rather than emitted transiently so the log survives a reload and
+ * shows up for a participant who was offline when the call happened.
+ *
+ * The caller is the sender, so the entry sits on the caller's side of the
+ * thread and reads as incoming for whoever was called.
+ */
+export async function createCallEventMessage({ io, conversationId, callerId, callEvent }) {
+  try {
+    const conversation = await Conversation.findOne({
+      _id: conversationId,
+      participants: callerId,
+    }).select('_id participants');
+    if (!conversation) return null;
+
+    const summary = getCallEventSummary(callEvent);
+    const message = await Message.create({
+      conversationId,
+      senderId: callerId,
+      text: '',
+      callEvent: {
+        type: callEvent.type === 'video' ? 'video' : 'audio',
+        outcome: callEvent.outcome,
+        durationSeconds: Math.max(0, Math.round(callEvent.durationSeconds || 0)),
+      },
+      status: 'sent',
+    });
+
+    await Conversation.findByIdAndUpdate(conversationId, {
+      lastMessage: summary,
+      updatedAt: new Date(),
+    });
+
+    const roomTargets = [
+      String(conversationId),
+      ...(conversation.participants || []).map((p) => `user:${p.toString()}`),
+    ];
+    io?.to(roomTargets).emit('receive_message', message.toJSON());
+
+    return message;
+  } catch (error) {
+    // A failed call log must never take down call teardown.
+    console.error('Unable to record call event:', error.message);
+    return null;
+  }
+}
+
 /**
  * Validate, persist and fan out a chat message. Shared by the socket handler and the
  * REST endpoint the service worker uses when flushing its offline outbox.

@@ -20,6 +20,19 @@ const messageSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: undefined,
     },
+    // Set on system messages that record a finished call, so the thread keeps a
+    // history of calls the way it keeps a history of messages.
+    callEvent: {
+      type: {
+        type: String,
+        enum: ['audio', 'video'],
+      },
+      outcome: {
+        type: String,
+        enum: ['completed', 'missed', 'declined', 'cancelled'],
+      },
+      durationSeconds: { type: Number, min: 0 },
+    },
     isDeleted: { type: Boolean, default: false },
     status: { type: String, enum: ['sent', 'delivered', 'read'], default: 'sent' },
   },
