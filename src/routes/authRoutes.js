@@ -72,7 +72,7 @@ router.post(
         user: serializeUser(user),
       });
     } catch (err) {
-      console.error('Error during signup:', err);
+      console.log('Error during signup:', err);
       return res.status(500).json({ error: 'Internal server error during signup' });
     }
   }
@@ -113,7 +113,7 @@ router.post(
         user: serializeUser(user),
       });
     } catch (err) {
-      console.error('Error during login:', err);
+      console.log('Error during login:', err);
       return res.status(500).json({ error: 'Internal server error during login' });
     }
   }
