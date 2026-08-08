@@ -41,7 +41,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   const origin = req.get('origin');
   const isStateChanging = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
-  if (isStateChanging && origin && !ALLOWED_ORIGINS.includes(origin)) {
+  if (isStateChanging && origin && origin !== ALLOWED_ORIGIN) {
     return res.status(403).json({ error: 'Request origin is not allowed' });
   }
   return next();
@@ -63,7 +63,7 @@ app.get("/", (req,res) => {
 // Socket.IO Server Setup
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: ALLOWED_ORIGINS,
+    origin: ALLOWED_ORIGIN,
     methods: ['GET', 'POST'],
     credentials: true,
   },
