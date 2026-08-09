@@ -1,4 +1,5 @@
 import { Message } from '../models/Message.js';
+import { Call } from '../models/Call.js';
 import { Conversation } from '../models/Conversation.js';
 import { User } from '../models/User.js';
 import mongoose from 'mongoose';
@@ -30,23 +31,80 @@ function clearCall(callId) {
 }
 
 /**
- * Write the call into the conversation. `logged` guards against double entries
- * when a hang-up races the ring/duration timeout.
+ * Move a call to its terminal state and write it into the conversation.
+ *
+ * Driven by the persisted Call document, not the in-memory map, so a call still
+ * gets logged when the process restarted mid-call or the map entry is gone.
+ * The status guard plus the atomic claim in createCallEventMessage together
+ * guarantee exactly one chat entry per call.
  */
-function logCall(io, call, outcome) {
-  if (!call || call.logged) return;
-  call.logged = true;
+async function finalizeCall(io, callId, outcome) {
+  try {
+    const callDoc = await Call.findOneAndUpdate(
+      { callId, status: { $ne: 'ended' } },
+      { $set: { status: 'ended', endedAt: new Date(), outcome } },
+      { new: true }
+    );
+    if (!callDoc) return;
 
-  const durationSeconds = call.acceptedAt
-    ? (Date.now() - call.acceptedAt) / 1000
-    : 0;
+    const durationSeconds = callDoc.acceptedAt
+      ? (Date.now() - new Date(callDoc.acceptedAt).getTime()) / 1000
+      : 0;
 
-  createCallEventMessage({
-    io,
-    conversationId: call.conversationId,
-    callerId: call.callerId,
-    callEvent: { type: call.type, outcome, durationSeconds },
+    await createCallEventMessage({
+      io,
+      callDocId: callDoc._id,
+      callId: callDoc.callId,
+      conversationId: callDoc.conversationId.toString(),
+      callerId: callDoc.callerId.toString(),
+      callEvent: { type: callDoc.type, outcome, durationSeconds },
+    });
+  } catch (error) {
+    console.error('Unable to finalize call:', error.message);
+  }
+}
+
+/**
+ * Calls left dangling by a crash or restart. Anything still ringing never
+ * connected; anything accepted was in progress when the process died.
+ */
+export async function sweepDanglingCalls(io) {
+  try {
+    const dangling = await Call.find({ status: { $ne: 'ended' } }).select('callId status');
+    for (const call of dangling) {
+      await finalizeCall(io, call.callId, call.status === 'accepted' ? 'completed' : 'missed');
+    }
+    if (dangling.length > 0) {
+      console.log(`📞 Recovered ${dangling.length} call(s) left open by a restart`);
+    }
+  } catch (error) {
+    console.error('Unable to sweep dangling calls:', error.message);
+  }
+}
+
+/**
+ * Terminal handling for a call whose in-memory entry is gone — the map does not
+ * survive a restart, and before this the hang-up was simply dropped and the
+ * call never appeared in the conversation.
+ */
+async function finalizeFromDatabase(io, callId, userId, outcomeIfRinging) {
+  const doc = await Call.findOne({ callId });
+  if (!doc || doc.status === 'ended') return false;
+  if (!doc.participantIds.some((id) => id.toString() === userId)) return false;
+
+  doc.participantIds.forEach((participantId) => {
+    io.to(`user:${participantId}`).emit('call_ended', {
+      callId,
+      endedBy: userId,
+      reason: 'ended',
+    });
   });
+  await finalizeCall(
+    io,
+    callId,
+    doc.status === 'accepted' ? 'completed' : outcomeIfRinging
+  );
+  return true;
 }
 
 export function setupSocketIO(io) {
@@ -251,10 +309,21 @@ export function setupSocketIO(io) {
             callId,
             reason: 'missed',
           });
-          logCall(io, call, 'missed');
+          finalizeCall(io, callId, 'missed');
           clearCall(callId);
         }, CALL_RING_TIMEOUT);
         activeCalls.set(callId, call);
+
+        // Persisted immediately: from here on, every terminal path can log the
+        // call from the database even if this process dies first.
+        await Call.create({
+          callId,
+          conversationId,
+          callerId: authenticatedUserId,
+          participantIds,
+          type,
+          status: 'ringing',
+        });
 
         recipientIds.forEach((recipientId) => {
           io.to(`user:${recipientId}`).emit('incoming_call', {
@@ -293,13 +362,17 @@ export function setupSocketIO(io) {
 
       call.status = 'accepted';
       call.acceptedAt = Date.now();
+      Call.updateOne(
+        { callId },
+        { $set: { status: 'accepted', acceptedAt: new Date() } }
+      ).catch((error) => console.error('Unable to mark call accepted:', error.message));
       if (call.timeout) clearTimeout(call.timeout);
       call.timeout = setTimeout(() => {
         emitToCallParticipants(io, call, 'call_ended', {
           callId,
           reason: 'timeout',
         });
-        logCall(io, call, 'completed');
+        finalizeCall(io, callId, 'completed');
         clearCall(callId);
       }, 2 * 60 * 60 * 1000);
       emitToCallParticipants(io, call, 'call_accepted', {
@@ -311,10 +384,18 @@ export function setupSocketIO(io) {
       acknowledge?.({ ok: true });
     });
 
-    socket.on('call_decline', ({ callId } = {}, acknowledge) => {
+    socket.on('call_decline', async ({ callId } = {}, acknowledge) => {
       const call = activeCalls.get(callId);
       if (!call || !call.participantIds.includes(authenticatedUserId)) {
-        acknowledge?.({ ok: false, error: 'Call is no longer available' });
+        const recovered = await finalizeFromDatabase(
+          io,
+          callId,
+          authenticatedUserId,
+          'declined'
+        );
+        acknowledge?.(
+          recovered ? { ok: true } : { ok: false, error: 'Call is no longer available' }
+        );
         return;
       }
 
@@ -322,15 +403,23 @@ export function setupSocketIO(io) {
         callId,
         declinedBy: authenticatedUserId,
       });
-      logCall(io, call, 'declined');
+      finalizeCall(io, callId, 'declined');
       clearCall(callId);
       acknowledge?.({ ok: true });
     });
 
-    socket.on('call_end', ({ callId } = {}, acknowledge) => {
+    socket.on('call_end', async ({ callId } = {}, acknowledge) => {
       const call = activeCalls.get(callId);
       if (!call || !call.participantIds.includes(authenticatedUserId)) {
-        acknowledge?.({ ok: false, error: 'Call is no longer active' });
+        const recovered = await finalizeFromDatabase(
+          io,
+          callId,
+          authenticatedUserId,
+          'cancelled'
+        );
+        acknowledge?.(
+          recovered ? { ok: true } : { ok: false, error: 'Call is no longer active' }
+        );
         return;
       }
 
@@ -339,7 +428,7 @@ export function setupSocketIO(io) {
         endedBy: authenticatedUserId,
         reason: 'ended',
       });
-      logCall(io, call, call.status === 'accepted' ? 'completed' : 'cancelled');
+      finalizeCall(io, callId, call.status === 'accepted' ? 'completed' : 'cancelled');
       clearCall(callId);
       acknowledge?.({ ok: true });
     });
@@ -385,7 +474,7 @@ export function setupSocketIO(io) {
               endedBy: authenticatedUserId,
               reason: 'disconnected',
             });
-            logCall(io, call, call.status === 'accepted' ? 'completed' : 'cancelled');
+            finalizeCall(io, callId, call.status === 'accepted' ? 'completed' : 'cancelled');
             clearCall(call.callId);
           });
       }

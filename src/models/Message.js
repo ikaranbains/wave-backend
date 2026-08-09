@@ -25,7 +25,7 @@ const messageSchema = new mongoose.Schema(
     callEvent: {
       type: {
         type: String,
-        enum: ['audio', 'video'],
+        enum: ['voice', 'video'],
       },
       outcome: {
         type: String,

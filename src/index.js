@@ -14,7 +14,7 @@ import { chatRoutes } from './routes/chatRoutes.js';
 import { uploadRoutes } from './routes/uploadRoutes.js';
 import { callRoutes } from './routes/callRoutes.js';
 import { pushRoutes } from './routes/pushRoutes.js';
-import { setupSocketIO } from './socket/socketHandler.js';
+import { setupSocketIO, sweepDanglingCalls } from './socket/socketHandler.js';
 import { configureCloudinary } from './config/cloudinary.js';
 
 const PORT = parseInt(process.env.PORT || '5000', 10);
@@ -79,6 +79,10 @@ async function startServer() {
     console.log(`📡 Connecting to MongoDB at ${MONGODB_URI}...`);
     await mongoose.connect(MONGODB_URI);
     console.log('✅ Mongoose connected to MongoDB successfully!');
+
+    // Any call still open belongs to a previous process: log it now so it is
+    // never silently lost from the conversation.
+    await sweepDanglingCalls(io);
 
     httpServer.listen(PORT, () => {
       console.log(`🚀 Wave Express Backend running on http://localhost:${PORT}`);

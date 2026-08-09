@@ -1,3 +1,5 @@
+import mongoose from 'mongoose';
+import { Call } from '../models/Call.js';
 import { Conversation } from '../models/Conversation.js';
 import { Message } from '../models/Message.js';
 import { User } from '../models/User.js';
@@ -141,8 +143,28 @@ export function getCallEventSummary({ type, outcome, durationSeconds }) {
  * The caller is the sender, so the entry sits on the caller's side of the
  * thread and reads as incoming for whoever was called.
  */
-export async function createCallEventMessage({ io, conversationId, callerId, callEvent }) {
+export async function createCallEventMessage({
+  io,
+  conversationId,
+  callerId,
+  callEvent,
+  callDocId,
+  callId,
+}) {
   try {
+    // Atomically claim the right to log this call. If another path (hang-up
+    // racing a timeout, or a restart sweep) already claimed it, stop here —
+    // this is what keeps exactly one entry per call.
+    const claimId = new mongoose.Types.ObjectId();
+    if (callDocId) {
+      const claimed = await Call.findOneAndUpdate(
+        { _id: callDocId, loggedMessageId: { $exists: false } },
+        { $set: { loggedMessageId: claimId } },
+        { new: false }
+      );
+      if (!claimed) return null;
+    }
+
     const conversation = await Conversation.findOne({
       _id: conversationId,
       participants: callerId,
@@ -151,11 +173,18 @@ export async function createCallEventMessage({ io, conversationId, callerId, cal
 
     const summary = getCallEventSummary(callEvent);
     const message = await Message.create({
+      _id: claimId,
       conversationId,
       senderId: callerId,
+      // Messages carry a unique {senderId, clientId} index, and a compound
+      // sparse index still indexes a doc when only senderId is set — so leaving
+      // this null let a sender log exactly one call ever, every later one
+      // failing on duplicate key. Keying it to the call also makes the write
+      // idempotent at the database level.
+      clientId: callId ? `call-${callId}` : undefined,
       text: '',
       callEvent: {
-        type: callEvent.type === 'video' ? 'video' : 'audio',
+        type: callEvent.type === 'video' ? 'video' : 'voice',
         outcome: callEvent.outcome,
         durationSeconds: Math.max(0, Math.round(callEvent.durationSeconds || 0)),
       },
