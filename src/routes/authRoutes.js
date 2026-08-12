@@ -1,4 +1,5 @@
 import express from 'express';
+import multer from 'multer';
 import { body } from 'express-validator';
 import bcrypt from 'bcryptjs';
 import { User } from '../models/User.js';
@@ -9,8 +10,44 @@ import {
   signAccessToken,
 } from '../middleware/authMiddleware.js';
 import { clearLoginAttempts, loginRateLimit } from '../middleware/loginRateLimit.js';
+import { cloudinary } from '../config/cloudinary.js';
 
 const router = express.Router();
+const signupPhotoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, callback) => {
+    if (!['image/jpeg', 'image/png'].includes(file.mimetype)) {
+      callback(new Error('Profile photos must be JPG or PNG images'));
+      return;
+    }
+    callback(null, true);
+  },
+});
+
+function receiveSignupPhoto(req, res, next) {
+  signupPhotoUpload.single('file')(req, res, (error) => {
+    if (!error) return next();
+    if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'Profile photos must be 2 MB or smaller' });
+    }
+    return res.status(400).json({ error: 'Choose a JPG or PNG profile photo' });
+  });
+}
+
+function uploadSignupPhoto(file) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: 'pulse-chat/avatars',
+        resource_type: 'image',
+        transformation: [{ width: 512, height: 512, crop: 'limit', quality: 'auto', fetch_format: 'auto' }],
+      },
+      (error, result) => (error ? reject(error) : resolve(result))
+    );
+    stream.end(file.buffer);
+  });
+}
 
 function getCookieOptions() {
   const isProduction = process.env.NODE_ENV === 'production';
@@ -42,20 +79,26 @@ function serializeUser(user) {
 // POST /api/auth/signup with express-validator
 router.post(
   '/signup',
+  receiveSignupPhoto,
   [
     body('name').trim().notEmpty().withMessage('Name is required'),
     body('email').isEmail().withMessage('Please provide a valid email address'),
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters long'),
+    body('statusMessage').optional().trim().isLength({ max: 160 }).withMessage('Bio must be 160 characters or fewer'),
     validate,
   ],
   async (req, res) => {
+    let uploadedPhoto;
+    let createdUser;
     try {
-      const { name, email, password } = req.body;
+      const { name, email, password, statusMessage } = req.body;
 
       const existingUser = await User.findOne({ email: email.toLowerCase() });
       if (existingUser) {
         return res.status(409).json({ error: 'An account with this email already exists' });
       }
+
+      if (req.file) uploadedPhoto = await uploadSignupPhoto(req.file);
 
       const passwordHash = await bcrypt.hash(password, 10);
       const user = await User.create({
@@ -63,7 +106,12 @@ router.post(
         email: email.toLowerCase(),
         passwordHash,
         status: 'online',
+        statusMessage: statusMessage || '',
+        avatar: uploadedPhoto?.secure_url || '',
+        avatarPublicId: uploadedPhoto?.public_id || '',
+        avatarResourceType: uploadedPhoto?.resource_type || 'image',
       });
+      createdUser = user;
 
       const token = signAccessToken(user);
       setSessionCookie(res, token);
@@ -72,6 +120,9 @@ router.post(
         user: serializeUser(user),
       });
     } catch (err) {
+      if (uploadedPhoto?.public_id && !createdUser) {
+        await cloudinary.uploader.destroy(uploadedPhoto.public_id, { resource_type: 'image' }).catch(() => {});
+      }
       console.log('Error during signup:', err);
       return res.status(500).json({ error: 'Internal server error during signup' });
     }

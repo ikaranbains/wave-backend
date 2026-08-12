@@ -276,12 +276,15 @@ export async function createAndBroadcastMessage({ io, senderId, data }) {
 
   io?.to(roomTargets).emit('receive_message', newMessage.toJSON());
 
-  await notifyOfflineParticipants({
+  // Push notifications are best-effort and must not hold up the socket ack.
+  // Free-tier push/database latency should not make the sender's composer feel
+  // blocked after the message has already been persisted and broadcast.
+  void notifyOfflineParticipants({
     io,
     conversation,
     senderId,
     message: newMessage,
-  });
+  }).catch((error) => console.error('Unable to notify offline participants:', error.message));
 
   return {
     ok: true,

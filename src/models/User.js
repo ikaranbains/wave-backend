@@ -9,6 +9,8 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
+    avatarPublicId: { type: String, default: '' },
+    avatarResourceType: { type: String, default: 'image' },
     phone: { type: String },
     status: { type: String, enum: ['online', 'offline', 'away'], default: 'online' },
     lastSeen: { type: String, default: 'Active now' },

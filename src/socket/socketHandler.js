@@ -433,53 +433,54 @@ export function setupSocketIO(io) {
       acknowledge?.({ ok: true });
     });
 
-    // Presence update
-    socket.on('user_online', async () => {
+    // Socket connection is the source of truth for live presence. Do not rely
+    // on the status saved during login, which can be stale after a refresh.
+    const publishOnlinePresence = async () => {
       const user = await User.findByIdAndUpdate(
         authenticatedUserId,
-        {
-          status: 'online',
-          lastSeen: 'Active now',
-        },
+        { status: 'online', lastSeen: 'Active now' },
         { new: true }
       ).select('preferences.showOnlineStatus');
       io.emit('presence_change', {
         userId: authenticatedUserId,
         status: user?.preferences?.showOnlineStatus === false ? 'offline' : 'online',
+        lastSeen: user?.preferences?.showOnlineStatus === false ? 'Private' : null,
       });
+    };
+
+    publishOnlinePresence().catch((error) =>
+      console.error('Unable to publish online presence:', error.message)
+    );
+
+    socket.on('presence_sync', () => {
+      publishOnlinePresence().catch((error) =>
+        console.error('Unable to sync online presence:', error.message)
+      );
     });
 
-    socket.on('disconnect', async () => {
-      await User.findByIdAndUpdate(
-        authenticatedUserId,
-        {
-          status: 'offline',
-          lastSeen: new Date().toISOString(),
-        }
-      );
-      io.emit('presence_change', { userId: authenticatedUserId, status: 'offline' });
+    socket.on('disconnect', () => {
+      // A user may have multiple tabs/devices. Only become offline after the
+      // last socket in that user's room has disconnected.
+      setImmediate(async () => {
+        const userRoom = io.sockets.adapter.rooms.get(`user:${authenticatedUserId}`);
+        if (userRoom?.size) return;
 
-      // Without this, a dropped connection leaves the call in `activeCalls`
-      // until its timeout — up to two hours — during which `hasBusyParticipant`
-      // rejects every new call to either party with "already on a call".
-      const stillConnected = io.sockets.adapter.rooms.get(
-        `user:${authenticatedUserId}`
-      );
-      if (!stillConnected || stillConnected.size === 0) {
-        [...activeCalls.values()]
-          .filter((call) => call.participantIds.includes(authenticatedUserId))
-          .forEach((call) => {
-            emitToCallParticipants(io, call, 'call_ended', {
-              callId: call.callId,
-              endedBy: authenticatedUserId,
-              reason: 'disconnected',
-            });
-            finalizeCall(io, callId, call.status === 'accepted' ? 'completed' : 'cancelled');
-            clearCall(call.callId);
+        try {
+          const user = await User.findByIdAndUpdate(
+            authenticatedUserId,
+            { status: 'offline', lastSeen: new Date().toISOString() },
+            { new: true }
+          ).select('preferences.showOnlineStatus lastSeen');
+          io.emit('presence_change', {
+            userId: authenticatedUserId,
+            status: 'offline',
+            lastSeen: user?.preferences?.showOnlineStatus === false ? 'Private' : user?.lastSeen,
           });
-      }
-
-      console.log(`🔌 Socket client disconnected: ${socket.id}`);
+          console.log(`🔌 Socket client disconnected: ${socket.id}`);
+        } catch (error) {
+          console.error('Unable to publish offline presence:', error.message);
+        }
+      });
     });
   });
 }
