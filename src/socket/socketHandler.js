@@ -13,15 +13,74 @@ import { randomUUID } from 'crypto';
 import {
   createAndBroadcastMessage,
   createCallEventMessage,
+  hasLiveSocket,
 } from '../services/messageService.js';
+import { sendPushToUser } from '../services/pushService.js';
 
 const activeCalls = new Map();
 const CALL_RING_TIMEOUT = 60_000;
+const TYPING_EVENT_INTERVAL_MS = 2_000;
+
+export function shouldForwardTypingStart(timestamps, conversationId, now = Date.now()) {
+  const previousTimestamp = timestamps.get(conversationId);
+  if (previousTimestamp !== undefined && now - previousTimestamp < TYPING_EVENT_INTERVAL_MS) {
+    return false;
+  }
+  timestamps.set(conversationId, now);
+  return true;
+}
+
+/**
+ * A socket-only invite never reaches a callee whose app is closed, so push the ring
+ * to every recipient with no live socket. The notification expires with the invite.
+ */
+async function pushIncomingCall({ io, recipientIds, caller, callId, conversationId, type }) {
+  const offlineRecipientIds = recipientIds.filter(
+    (recipientId) => !hasLiveSocket(io, recipientId)
+  );
+  if (offlineRecipientIds.length === 0) return;
+
+  const recipients = await User.find({ _id: { $in: offlineRecipientIds } }).select(
+    'preferences.notificationsEnabled'
+  );
+
+  await Promise.all(
+    recipients
+      .filter((recipient) => recipient.preferences?.notificationsEnabled !== false)
+      .map((recipient) =>
+        sendPushToUser(
+          recipient._id,
+          {
+            title: caller.name || 'Wave',
+            body: type === 'video' ? 'Incoming video call' : 'Incoming voice call',
+            tag: `call-${callId}`,
+            url: '/',
+            data: { kind: 'call', callId, conversationId, type },
+          },
+          {
+            ttlSeconds: Math.floor(CALL_RING_TIMEOUT / 1000),
+            requireInteraction: true,
+          }
+        ).catch((error) => console.error('Unable to queue call push:', error.message))
+      )
+  );
+}
 
 function emitToCallParticipants(io, call, eventName, payload) {
   call.participantIds.forEach((participantId) => {
     io.to(`user:${participantId}`).emit(eventName, payload);
   });
+}
+
+export async function emitPresenceChange(emitter, userId, presenceData) {
+  const participantIds = await Conversation.distinct('participants', { participants: userId });
+  const normalizedUserId = userId.toString();
+  const roomIds = participantIds
+    .map((participantId) => participantId.toString())
+    .filter((participantId) => participantId !== normalizedUserId)
+    .map((participantId) => `user:${participantId}`);
+
+  if (roomIds.length > 0) emitter.to(roomIds).emit('presence_change', presenceData);
 }
 
 function clearCall(callId) {
@@ -132,6 +191,7 @@ export function setupSocketIO(io) {
   io.on('connection', (socket) => {
     console.log(`🔌 Socket client connected: ${socket.id}`);
     const authenticatedUserId = socket.user.userId;
+    const typingStartedAt = new Map();
     socket.join(`user:${authenticatedUserId}`);
 
     // Join conversation room
@@ -177,9 +237,86 @@ export function setupSocketIO(io) {
       }
     });
 
+    socket.on('message_delivered', async ({ messageId } = {}) => {
+      if (!mongoose.Types.ObjectId.isValid(messageId)) return;
+
+      try {
+        const message = await Message.findById(messageId).select('conversationId senderId');
+        if (!message || message.senderId.toString() === authenticatedUserId) return;
+
+        const conversation = await Conversation.findOne({
+          _id: message.conversationId,
+          participants: authenticatedUserId,
+        }).select('participants');
+        if (!conversation) return;
+
+        const updated = await Message.findOneAndUpdate(
+          { _id: messageId, status: 'sent' },
+          { $set: { status: 'delivered' } },
+          { new: true }
+        ).select('_id');
+        if (!updated) return;
+
+        io.to(conversation.participants.map((id) => `user:${id.toString()}`)).emit(
+          'message_status',
+          {
+            conversationId: message.conversationId.toString(),
+            messageIds: [messageId],
+            status: 'delivered',
+          }
+        );
+      } catch (error) {
+        console.error('Unable to mark message delivered:', error.message);
+      }
+    });
+
+    socket.on('messages_read', async ({ conversationId } = {}) => {
+      if (!mongoose.Types.ObjectId.isValid(conversationId)) return;
+
+      try {
+        const conversation = await Conversation.findOne({
+          _id: conversationId,
+          participants: authenticatedUserId,
+        }).select('participants');
+        if (!conversation) return;
+
+        const unreadMessages = await Message.find({
+          conversationId,
+          senderId: { $ne: authenticatedUserId },
+          status: { $ne: 'read' },
+        })
+          .select('_id')
+          .lean();
+        const messageIds = unreadMessages.map((message) => message._id);
+
+        await Promise.all([
+          messageIds.length
+            ? Message.updateMany({ _id: { $in: messageIds } }, { $set: { status: 'read' } })
+            : Promise.resolve(),
+          Conversation.updateOne(
+            { _id: conversationId },
+            { $set: { [`unreadCounts.${authenticatedUserId}`]: 0 } }
+          ),
+        ]);
+
+        if (messageIds.length === 0) return;
+        io.to(conversation.participants.map((id) => `user:${id.toString()}`)).emit(
+          'message_status',
+          {
+            conversationId,
+            messageIds: messageIds.map(String),
+            status: 'read',
+          }
+        );
+      } catch (error) {
+        console.error('Unable to mark messages read:', error.message);
+      }
+    });
+
     // Handle real-time typing indicators
     socket.on('typing_start', ({ conversationId }) => {
       if (!conversationId) return;
+      if (!shouldForwardTypingStart(typingStartedAt, conversationId)) return;
       socket.to(conversationId).emit('user_typing', {
         conversationId,
         userId: authenticatedUserId,
@@ -188,6 +325,7 @@ export function setupSocketIO(io) {
 
     socket.on('typing_stop', ({ conversationId }) => {
       if (!conversationId) return;
+      if (!typingStartedAt.delete(conversationId)) return;
       socket.to(conversationId).emit('user_stop_typing', {
         conversationId,
         userId: authenticatedUserId,
@@ -338,6 +476,16 @@ export function setupSocketIO(io) {
           });
         });
 
+        // Not awaited: the caller's UI should start ringing without waiting on FCM.
+        pushIncomingCall({
+          io,
+          recipientIds,
+          caller,
+          callId,
+          conversationId,
+          type,
+        }).catch((error) => console.error('Unable to push incoming call:', error.message));
+
         acknowledge?.({
           ok: true,
           call: { callId, conversationId, type, status: 'ringing' },
@@ -441,7 +589,7 @@ export function setupSocketIO(io) {
         { status: 'online', lastSeen: 'Active now' },
         { new: true }
       ).select('preferences.showOnlineStatus');
-      io.emit('presence_change', {
+      await emitPresenceChange(socket, authenticatedUserId, {
         userId: authenticatedUserId,
         status: user?.preferences?.showOnlineStatus === false ? 'offline' : 'online',
         lastSeen: user?.preferences?.showOnlineStatus === false ? 'Private' : null,
@@ -471,7 +619,7 @@ export function setupSocketIO(io) {
             { status: 'offline', lastSeen: new Date().toISOString() },
             { new: true }
           ).select('preferences.showOnlineStatus lastSeen');
-          io.emit('presence_change', {
+          await emitPresenceChange(io, authenticatedUserId, {
             userId: authenticatedUserId,
             status: 'offline',
             lastSeen: user?.preferences?.showOnlineStatus === false ? 'Private' : user?.lastSeen,

@@ -7,6 +7,12 @@ import { validate } from '../middleware/validate.js';
 import { authenticate } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
+const USER_SEARCH_LIMIT = 30;
+
+export function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024, files: 1 },
@@ -29,7 +35,7 @@ function uploadAvatarBuffer(file) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
       {
-        folder: 'pulse-chat/avatars',
+        folder: 'wave/avatars',
         resource_type: 'image',
         transformation: [{ width: 512, height: 512, crop: 'limit', quality: 'auto', fetch_format: 'auto' }],
       },
@@ -51,16 +57,21 @@ router.get(
       };
 
       if (search) {
+        const escapedSearch = escapeRegex(search);
         filterQuery.$or = [
-          { name: { $regex: search, $options: 'i' } },
-          { email: { $regex: search, $options: 'i' } },
+          { name: { $regex: escapedSearch, $options: 'i' } },
+          { email: { $regex: escapedSearch, $options: 'i' } },
         ];
       }
 
-      const users = await User.find(filterQuery).select('-passwordHash').sort({ name: 1 });
+      const users = await User.find(filterQuery)
+        .select('-passwordHash')
+        .sort({ name: 1 })
+        .limit(USER_SEARCH_LIMIT)
+        .lean();
       return res.json({
         users: users.map((user) => {
-          const serialized = user.toObject();
+          const serialized = user;
           if (serialized.preferences?.showOnlineStatus === false) {
             serialized.status = 'offline';
             serialized.lastSeen = 'Private';

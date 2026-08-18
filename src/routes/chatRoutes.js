@@ -1,5 +1,5 @@
 import express from 'express';
-import { body, param } from 'express-validator';
+import { body, param, query } from 'express-validator';
 import mongoose from 'mongoose';
 import { Conversation } from '../models/Conversation.js';
 import { Message } from '../models/Message.js';
@@ -23,7 +23,8 @@ function hidePrivatePresence(participant) {
 }
 
 function sanitizeConversationPresence(conversation) {
-  const serialized = conversation.toObject();
+  const serialized =
+    typeof conversation?.toObject === 'function' ? conversation.toObject() : conversation;
   serialized.participants = serialized.participants.map(hidePrivatePresence);
   return serialized;
 }
@@ -33,7 +34,8 @@ router.get('/conversations', authenticate, async (req, res) => {
   try {
     const conversations = await Conversation.find({ participants: req.user.userId })
       .populate('participants', 'name email avatar status lastSeen preferences')
-      .sort({ updatedAt: -1 });
+      .sort({ updatedAt: -1 })
+      .lean();
 
     return res.json({
       conversations: conversations.map(sanitizeConversationPresence),
@@ -44,24 +46,70 @@ router.get('/conversations', authenticate, async (req, res) => {
   }
 });
 
-// GET /api/messages/:conversationId - Get messages for a thread
+const MESSAGE_PAGE_SIZE = 50;
+const MESSAGE_PAGE_LIMIT = 100;
+
+/**
+ * Cursor filter for one page of thread history, walking backwards in time.
+ *
+ * createdAt alone is not a unique cursor: two messages sharing a millisecond at a
+ * page boundary would drop one. The _id tie-break closes that hole. Exported so
+ * scripts/messagePaginationSelfCheck.js exercises the real filter, not a copy.
+ */
+export function buildMessagePageFilter({ conversationId, before, beforeId }) {
+  const filter = { conversationId };
+  if (!before) return filter;
+
+  const cursor = new Date(before);
+  filter.$or = beforeId
+    ? [{ createdAt: { $lt: cursor } }, { createdAt: cursor, _id: { $lt: beforeId } }]
+    : [{ createdAt: { $lt: cursor } }];
+  return filter;
+}
+
+// GET /api/messages/:conversationId - Get one page of a thread, newest page first
 router.get(
   '/messages/:conversationId',
-  [authenticate, param('conversationId').isMongoId().withMessage('Invalid conversation ID'), validate],
+  [
+    authenticate,
+    param('conversationId').isMongoId().withMessage('Invalid conversation ID'),
+    query('limit').optional().isInt({ min: 1, max: MESSAGE_PAGE_LIMIT }).toInt(),
+    query('before').optional().isISO8601().withMessage('before must be an ISO 8601 date'),
+    query('beforeId').optional().isMongoId().withMessage('Invalid beforeId'),
+    validate,
+  ],
   async (req, res) => {
     try {
       const { conversationId } = req.params;
       const conversation = await Conversation.findOne({
         _id: conversationId,
         participants: req.user.userId,
-      }).select('_id');
+      })
+        .select('_id')
+        .lean();
 
       if (!conversation) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
 
-      const messages = await Message.find({ conversationId }).sort({ createdAt: 1 });
-      return res.json({ messages });
+      const limit = req.query.limit || MESSAGE_PAGE_SIZE;
+      const filter = buildMessagePageFilter({
+        conversationId,
+        before: req.query.before,
+        beforeId: req.query.beforeId,
+      });
+
+      // One extra document is the cheapest way to know whether an older page exists.
+      const page = await Message.find(filter)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit + 1)
+        .lean();
+
+      const hasMore = page.length > limit;
+      if (hasMore) page.pop();
+
+      // Query order is newest-first for the limit; the client renders oldest-first.
+      return res.json({ messages: page.reverse(), hasMore });
     } catch (err) {
       console.error('Error fetching messages:', err);
       return res.status(500).json({ error: 'Failed to fetch messages' });
@@ -110,8 +158,68 @@ router.post(
   }
 );
 
+// POST /api/messages/batch - Flush up to 10 idempotent offline messages at once.
+router.post(
+  '/messages/batch',
+  [
+    authenticate,
+    body('messages')
+      .isArray({ min: 1, max: 10 })
+      .withMessage('messages must contain between 1 and 10 items')
+      .custom((messages) => {
+        const clientIds = messages.map((message) => message?.clientId?.trim());
+        return new Set(clientIds).size === clientIds.length;
+      })
+      .withMessage('clientId must be unique within a batch'),
+    body('messages.*.conversationId').isMongoId().withMessage('Invalid conversation ID'),
+    body('messages.*.clientId').isString().trim().notEmpty().isLength({ max: 80 }),
+    body('messages.*.text').optional().isString().isLength({ max: 8000 }),
+    validate,
+  ],
+  async (req, res) => {
+    // Messages in one thread retain their queued order; unrelated threads run concurrently.
+    const conversationTails = new Map();
+    const attempts = await Promise.allSettled(
+      req.body.messages.map((data) => {
+        const previous = conversationTails.get(data.conversationId) || Promise.resolve();
+        const attempt = previous.then(() =>
+          createAndBroadcastMessage({
+            io: req.app.get('io'),
+            senderId: req.user.userId,
+            data,
+          })
+        );
+        conversationTails.set(data.conversationId, attempt.catch(() => {}));
+        return attempt;
+      })
+    );
+
+    const results = attempts.map((attempt, index) => {
+      const clientId = req.body.messages[index].clientId;
+      if (attempt.status === 'rejected') {
+        console.error('Error sending batched message via REST:', attempt.reason);
+        return { clientId, ok: false, status: 500, error: 'Unable to send message' };
+      }
+
+      const result = attempt.value;
+      if (!result.ok) {
+        return { clientId, ok: false, status: result.status || 400, error: result.error };
+      }
+      return {
+        clientId,
+        ok: true,
+        status: result.duplicate ? 200 : 201,
+        messageId: result.messageId,
+        message: result.message,
+      };
+    });
+
+    return res.json({ results });
+  }
+);
+
 // POST /api/messages - Send a message over HTTP.
-// Used by the service worker when it flushes the offline outbox in the background,
+// Used by the service worker when it flushes one offline message in the background,
 // where no socket connection is available. clientId keeps the write idempotent.
 router.post(
   '/messages',

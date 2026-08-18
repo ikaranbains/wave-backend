@@ -39,7 +39,7 @@ function uploadSignupPhoto(file) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
       {
-        folder: 'pulse-chat/avatars',
+        folder: 'wave/avatars',
         resource_type: 'image',
         transformation: [{ width: 512, height: 512, crop: 'limit', quality: 'auto', fetch_format: 'auto' }],
       },

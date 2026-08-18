@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 
 const messageSchema = new mongoose.Schema(
   {
-    conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true, index: true },
+    conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true },
     senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     clientId: { type: String, trim: true, maxlength: 80 },
     text: { type: String, default: '' },
@@ -39,9 +39,20 @@ const messageSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// Partial, not sparse. A compound sparse index skips a document only when EVERY
+// indexed field is missing, and senderId is always set — so a missing clientId was
+// still indexed as null, and the second such message from one sender died on a
+// duplicate key. A partial index leaves those documents out of the index entirely
+// while still enforcing idempotency for the clientIds that do exist.
 messageSchema.index(
   { senderId: 1, clientId: 1 },
-  { unique: true, sparse: true }
+  { unique: true, partialFilterExpression: { clientId: { $type: 'string' } } }
 );
+
+// Thread history pages with find({ conversationId }).sort({ createdAt }), and the
+// pagination cursor tie-breaks on _id. This covers the match, the sort and the
+// cursor, so no in-memory sort is needed. Its conversationId prefix also replaces
+// the standalone conversationId index.
+messageSchema.index({ conversationId: 1, createdAt: 1, _id: 1 });
 
 export const Message = mongoose.model('Message', messageSchema);

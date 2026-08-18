@@ -49,7 +49,7 @@ function uploadBuffer(file) {
     const uploadStream = cloudinary.uploader.upload_stream(
       {
         resource_type: 'auto',
-        folder: 'pulse-chat/attachments',
+        folder: 'wave/attachments',
         use_filename: true,
         unique_filename: true,
       },

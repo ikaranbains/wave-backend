@@ -66,7 +66,7 @@ function normalizeReplyTo(replyTo) {
   };
 }
 
-function hasLiveSocket(io, userId) {
+export function hasLiveSocket(io, userId) {
   const room = io?.sockets?.adapter?.rooms?.get(`user:${userId}`);
   return Boolean(room && room.size > 0);
 }
@@ -264,9 +264,18 @@ export async function createAndBroadcastMessage({ io, senderId, data }) {
     status: 'sent',
   });
 
+  const unreadIncrements = Object.fromEntries(
+    conversation.participants
+      .map((participant) => participant.toString())
+      .filter((participantId) => participantId !== senderId.toString())
+      .map((participantId) => [`unreadCounts.${participantId}`, 1])
+  );
   await Conversation.findByIdAndUpdate(conversationId, {
-    lastMessage: normalizedText || getAttachmentSummary(normalizedAttachment),
-    updatedAt: new Date(),
+    $set: {
+      lastMessage: normalizedText || getAttachmentSummary(normalizedAttachment),
+      updatedAt: new Date(),
+    },
+    $inc: unreadIncrements,
   });
 
   const roomTargets = [

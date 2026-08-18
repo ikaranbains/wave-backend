@@ -5,13 +5,13 @@ import { validate } from '../middleware/validate.js';
 import {
   getPushPublicKey,
   isPushConfigured,
-  removeSubscription,
-  saveSubscription,
+  removeToken,
+  saveToken,
 } from '../services/pushService.js';
 
 const router = express.Router();
 
-// GET /api/push/public-key - VAPID application server key for the browser
+// GET /api/push/public-key - Firebase Web Push certificate key for getToken({ vapidKey })
 router.get('/public-key', (req, res) => {
   return res.json({
     enabled: isPushConfigured(),
@@ -19,31 +19,21 @@ router.get('/public-key', (req, res) => {
   });
 });
 
-// POST /api/push/subscribe - Register this browser/device for web push
+// POST /api/push/subscribe - Register this browser's FCM registration token
 router.post(
   '/subscribe',
-  [
-    authenticate,
-    body('subscription.endpoint').isURL({ protocols: ['https'], require_protocol: true }),
-    body('subscription.keys.p256dh').isString().notEmpty(),
-    body('subscription.keys.auth').isString().notEmpty(),
-    validate,
-  ],
+  [authenticate, body('token').isString().isLength({ min: 20, max: 4096 }), validate],
   async (req, res) => {
     if (!isPushConfigured()) {
       return res.status(503).json({ error: 'Push notifications are not configured' });
     }
 
     try {
-      await saveSubscription(
-        req.user.userId,
-        req.body.subscription,
-        req.get('user-agent') || ''
-      );
+      await saveToken(req.user.userId, req.body.token, req.get('user-agent') || '');
       return res.status(201).json({ ok: true });
     } catch (error) {
-      console.error('Error saving push subscription:', error);
-      return res.status(400).json({ error: error.message || 'Unable to save subscription' });
+      console.error('Error saving FCM token:', error);
+      return res.status(400).json({ error: error.message || 'Unable to save token' });
     }
   }
 );
@@ -51,14 +41,14 @@ router.post(
 // POST /api/push/unsubscribe - Forget this browser/device
 router.post(
   '/unsubscribe',
-  [authenticate, body('endpoint').isString().notEmpty(), validate],
+  [authenticate, body('token').isString().notEmpty(), validate],
   async (req, res) => {
     try {
-      await removeSubscription(req.user.userId, req.body.endpoint);
+      await removeToken(req.user.userId, req.body.token);
       return res.json({ ok: true });
     } catch (error) {
-      console.error('Error removing push subscription:', error);
-      return res.status(500).json({ error: 'Unable to remove subscription' });
+      console.error('Error removing FCM token:', error);
+      return res.status(500).json({ error: 'Unable to remove token' });
     }
   }
 );

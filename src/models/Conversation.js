@@ -9,4 +9,9 @@ const conversationSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// The inbox query is Conversation.find({ participants }).sort({ updatedAt: -1 }).
+// A multikey compound index serves both halves, so neither a collection scan nor an
+// in-memory sort is needed on every conversation list load.
+conversationSchema.index({ participants: 1, updatedAt: -1 });
+
 export const Conversation = mongoose.model('Conversation', conversationSchema);

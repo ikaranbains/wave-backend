@@ -43,7 +43,7 @@ router.post(
 
       const { LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET } =
         getLiveKitConfiguration();
-      const roomName = `pulse-chat-${conversationId}`;
+      const roomName = `wave-${conversationId}`;
       const accessToken = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
         identity: req.user.userId,
         name: user.name,

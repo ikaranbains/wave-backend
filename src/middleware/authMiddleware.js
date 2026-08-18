@@ -16,20 +16,20 @@ export function signAccessToken(user) {
     getJwtSecret(),
     {
       expiresIn: '7d',
-      issuer: 'pulsechat-api',
-      audience: 'pulsechat-client',
+      issuer: 'wave-api',
+      audience: 'wave-client',
     }
   );
 }
 
 export function verifyAccessToken(token) {
   return jwt.verify(token, getJwtSecret(), {
-    issuer: 'pulsechat-api',
-    audience: 'pulsechat-client',
+    issuer: 'wave-api',
+    audience: 'wave-client',
   });
 }
 
-export const AUTH_COOKIE_NAME = 'pingme_session';
+export const AUTH_COOKIE_NAME = 'wave_session';
 
 export function parseCookies(cookieHeader = '') {
   return cookieHeader.split(';').reduce((cookies, entry) => {
