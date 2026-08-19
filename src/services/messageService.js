@@ -66,9 +66,23 @@ function normalizeReplyTo(replyTo) {
   };
 }
 
-export function hasLiveSocket(io, userId) {
+/**
+ * True only while the user has a client that can actually show them the message.
+ *
+ * An open socket is not enough: a backgrounded PWA and a hidden browser tab keep
+ * theirs alive, so gating push on socket presence silently swallowed every
+ * notification for exactly the case push exists for. Clients report visibility over
+ * `app_visibility`; one that never reports is assumed visible, which is the old
+ * behaviour and keeps an older build from being spammed with duplicate pushes.
+ */
+export function hasVisibleClient(io, userId) {
   const room = io?.sockets?.adapter?.rooms?.get(`user:${userId}`);
-  return Boolean(room && room.size > 0);
+  if (!room || room.size === 0) return false;
+
+  for (const socketId of room) {
+    if (io.sockets.sockets.get(socketId)?.data?.isVisible !== false) return true;
+  }
+  return false;
 }
 
 /**
@@ -81,7 +95,7 @@ async function notifyOfflineParticipants({ io, conversation, senderId, message }
     .filter((participantId) => participantId !== senderId.toString());
 
   const offlineRecipientIds = recipientIds.filter(
-    (recipientId) => !hasLiveSocket(io, recipientId)
+    (recipientId) => !hasVisibleClient(io, recipientId)
   );
   if (offlineRecipientIds.length === 0) return;
 

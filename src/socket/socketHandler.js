@@ -13,7 +13,7 @@ import { randomUUID } from 'crypto';
 import {
   createAndBroadcastMessage,
   createCallEventMessage,
-  hasLiveSocket,
+  hasVisibleClient,
 } from '../services/messageService.js';
 import { sendPushToUser } from '../services/pushService.js';
 
@@ -36,7 +36,7 @@ export function shouldForwardTypingStart(timestamps, conversationId, now = Date.
  */
 async function pushIncomingCall({ io, recipientIds, caller, callId, conversationId, type }) {
   const offlineRecipientIds = recipientIds.filter(
-    (recipientId) => !hasLiveSocket(io, recipientId)
+    (recipientId) => !hasVisibleClient(io, recipientId)
   );
   if (offlineRecipientIds.length === 0) return;
 
@@ -193,6 +193,13 @@ export function setupSocketIO(io) {
     const authenticatedUserId = socket.user.userId;
     const typingStartedAt = new Map();
     socket.join(`user:${authenticatedUserId}`);
+
+    // Whether this client is on screen. Only a visible client suppresses web push,
+    // so a backgrounded PWA still gets notified. Assumed visible until told otherwise.
+    socket.data.isVisible = true;
+    socket.on('app_visibility', ({ isVisible } = {}) => {
+      socket.data.isVisible = isVisible !== false;
+    });
 
     // Join conversation room
     socket.on('join_conversation', async (conversationId, acknowledge) => {

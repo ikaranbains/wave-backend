@@ -10,6 +10,11 @@ import {
   signAccessToken,
 } from '../middleware/authMiddleware.js';
 import { clearLoginAttempts, loginRateLimit } from '../middleware/loginRateLimit.js';
+import {
+  consumeBackupCode,
+  isBackupCode,
+  isPasswordResetConfigured,
+} from '../services/passwordResetService.js';
 import { cloudinary } from '../config/cloudinary.js';
 
 const router = express.Router();
@@ -166,6 +171,62 @@ router.post(
     } catch (err) {
       console.log('Error during login:', err);
       return res.status(500).json({ error: 'Internal server error during login' });
+    }
+  }
+);
+
+// POST /api/auth/reset-password - Reset with a hand-issued backup code.
+//
+// Wave has no mail sender, so there is no emailed reset link. The operator hands a
+// single-use code to the person who needs it. Deliberately not rate limited; every
+// failure returns the same message so this cannot be used to discover which email
+// addresses have accounts or which codes are live.
+router.post(
+  '/reset-password',
+  [
+    body('email').isEmail().withMessage('Please provide a valid email address'),
+    body('backupCode').isString().trim().notEmpty().withMessage('Backup code is required'),
+    body('password')
+      .isLength({ min: 6 })
+      .withMessage('Password must be at least 6 characters long'),
+    validate,
+  ],
+  async (req, res) => {
+    const INVALID = 'That email and backup code do not match. Check both and try again.';
+    try {
+      if (!isPasswordResetConfigured()) {
+        return res
+          .status(503)
+          .json({ error: 'Password resets are not available. Contact support.' });
+      }
+
+      const { email, backupCode, password } = req.body;
+      const user = await User.findOne({ email: email.toLowerCase() });
+
+      // Checked together so a wrong email and a wrong code are indistinguishable.
+      if (!user || !isBackupCode(backupCode)) {
+        return res.status(400).json({ error: INVALID });
+      }
+
+      // Claimed before the password is written, so a code cannot be spent twice even
+      // if two requests arrive at once.
+      const claimed = await consumeBackupCode(backupCode, user._id, req.ip);
+      if (!claimed) {
+        return res
+          .status(400)
+          .json({ error: 'That backup code has already been used. Ask for a new one.' });
+      }
+
+      user.passwordHash = await bcrypt.hash(password, 10);
+      await user.save();
+      // Someone resetting has usually just locked themselves out of /login. Clearing
+      // the login limiter lets them sign in with the new password straight away.
+      clearLoginAttempts(req);
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.log('Error during password reset:', err);
+      return res.status(500).json({ error: 'Internal server error during password reset' });
     }
   }
 );

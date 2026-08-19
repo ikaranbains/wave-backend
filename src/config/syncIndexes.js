@@ -3,8 +3,9 @@ import { Conversation } from '../models/Conversation.js';
 import { DeviceToken } from '../models/DeviceToken.js';
 import { Message } from '../models/Message.js';
 import { User } from '../models/User.js';
+import { UsedResetCode } from '../models/UsedResetCode.js';
 
-const models = [User, Conversation, Message, Call, DeviceToken];
+const models = [User, Conversation, Message, Call, DeviceToken, UsedResetCode];
 
 /**
  * Bring every collection's indexes in line with its schema: create what is new, drop

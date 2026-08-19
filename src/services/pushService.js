@@ -87,13 +87,26 @@ export function stringifyData(data = {}) {
   );
 }
 
+/** FCM requires webpush fcmOptions.link to be an absolute HTTPS URL, or it rejects the message. */
+export function webpushLink(url, baseUrl = process.env.APP_BASE_URL) {
+  if (!baseUrl) return '';
+  try {
+    const link = new URL(url || '/', baseUrl);
+    return link.protocol === 'https:' ? link.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
 // FCM rejects a multicast batch larger than 500 tokens.
 const FCM_BATCH_SIZE = 500;
 
+// Only codes that mean "this token is dead". `messaging/invalid-argument` is NOT
+// one: FCM also returns it for a malformed message (a non-HTTPS webpush link, a
+// bad field), and pruning on it wipes every device row over a payload bug.
 const DEAD_TOKEN_CODES = new Set([
   'messaging/registration-token-not-registered',
   'messaging/invalid-registration-token',
-  'messaging/invalid-argument',
 ]);
 
 /**
@@ -126,10 +139,10 @@ export async function sendPushToUser(userId, payload, options = {}) {
         renotify: Boolean(tag),
         requireInteraction,
       },
-      // Absolute HTTPS URL required by FCM, so only set it when one is configured.
-      ...(process.env.APP_BASE_URL
-        ? { fcmOptions: { link: new URL(url || '/', process.env.APP_BASE_URL).toString() } }
-        : {}),
+      // FCM rejects the whole message with invalid-argument unless the link is
+      // absolute HTTPS, so an http:// or unset APP_BASE_URL means send no link at
+      // all — notificationclick in sw.js already routes from `data.url`.
+      ...(webpushLink(url) ? { fcmOptions: { link: webpushLink(url) } } : {}),
     },
   };
 
@@ -163,6 +176,10 @@ export async function sendPushToUser(userId, payload, options = {}) {
 
   if (deadTokens.length > 0) {
     await DeviceToken.deleteMany({ token: { $in: deadTokens } });
+  }
+
+  if (sent === 0) {
+    console.warn(`Push to ${userId}: 0 of ${tokens.length} device(s) delivered.`);
   }
 
   return { sent, pruned: deadTokens.length };
