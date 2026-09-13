@@ -72,15 +72,50 @@ function emitToCallParticipants(io, call, eventName, payload) {
   });
 }
 
-export async function emitPresenceChange(emitter, userId, presenceData) {
-  const participantIds = await Conversation.distinct('participants', { participants: userId });
-  const normalizedUserId = userId.toString();
-  const roomIds = participantIds
-    .map((participantId) => participantId.toString())
-    .filter((participantId) => participantId !== normalizedUserId)
-    .map((participantId) => `user:${participantId}`);
+function isUserSocketConnected(io, userId) {
+  const room = io.sockets.adapter.rooms.get(`user:${userId}`);
+  return Boolean(room && room.size > 0);
+}
 
-  if (roomIds.length > 0) emitter.to(roomIds).emit('presence_change', presenceData);
+function incomingCallPayload(call) {
+  return {
+    callId: call.callId,
+    conversationId: call.conversationId,
+    type: call.type,
+    caller: call.caller,
+  };
+}
+
+async function notifyOfflineCallRecipients(io, call, recipientIds) {
+  const offlineRecipientIds = recipientIds.filter(
+    (recipientId) => !isUserSocketConnected(io, recipientId)
+  );
+  if (offlineRecipientIds.length === 0) return;
+
+  const recipients = await User.find({ _id: { $in: offlineRecipientIds } }).select(
+    'preferences.notificationsEnabled'
+  );
+  const kind = call.type === 'video' ? 'video' : 'voice';
+
+  await Promise.all(
+    recipients
+      .filter((recipient) => recipient.preferences?.notificationsEnabled !== false)
+      .map((recipient) =>
+        sendPushToUser(recipient._id, {
+          title: `Incoming ${kind} call`,
+          body: `${call.caller.name || 'Someone'} is calling`,
+          icon: '/wave-192.png',
+          badge: '/wave-192.png',
+          tag: `call-${call.callId}`,
+          requireInteraction: true,
+          data: {
+            url: '/',
+            conversationId: call.conversationId,
+            callId: call.callId,
+          },
+        }).catch((error) => console.error('Unable to send incoming call push:', error.message))
+      )
+  );
 }
 
 function clearCall(callId) {
@@ -194,11 +229,17 @@ export function setupSocketIO(io) {
     const typingStartedAt = new Map();
     socket.join(`user:${authenticatedUserId}`);
 
-    // Whether this client is on screen. Only a visible client suppresses web push,
-    // so a backgrounded PWA still gets notified. Assumed visible until told otherwise.
-    socket.data.isVisible = true;
-    socket.on('app_visibility', ({ isVisible } = {}) => {
-      socket.data.isVisible = isVisible !== false;
+    // An installed PWA can be suspended or closed while a call starts. The
+    // client asks for this only after it has subscribed to `incoming_call`, so
+    // the replay cannot race the app's initial render.
+    socket.on('call_sync', () => {
+      const pendingCall = [...activeCalls.values()].find(
+        (call) =>
+          call.status === 'ringing' &&
+          call.callerId !== authenticatedUserId &&
+          call.participantIds.includes(authenticatedUserId)
+      );
+      if (pendingCall) socket.emit('incoming_call', incomingCallPayload(pendingCall));
     });
 
     // Join conversation room
@@ -445,6 +486,11 @@ export function setupSocketIO(io) {
           conversationId,
           type,
           callerId: authenticatedUserId,
+          caller: {
+            id: caller._id.toString(),
+            name: caller.name,
+            avatar: caller.avatar,
+          },
           participantIds,
           status: 'ringing',
         };
@@ -471,17 +517,9 @@ export function setupSocketIO(io) {
         });
 
         recipientIds.forEach((recipientId) => {
-          io.to(`user:${recipientId}`).emit('incoming_call', {
-            callId,
-            conversationId,
-            type,
-            caller: {
-              id: caller._id.toString(),
-              name: caller.name,
-              avatar: caller.avatar,
-            },
-          });
+          io.to(`user:${recipientId}`).emit('incoming_call', incomingCallPayload(call));
         });
+        void notifyOfflineCallRecipients(io, call, recipientIds);
 
         // Not awaited: the caller's UI should start ringing without waiting on FCM.
         pushIncomingCall({
@@ -586,6 +624,21 @@ export function setupSocketIO(io) {
       finalizeCall(io, callId, call.status === 'accepted' ? 'completed' : 'cancelled');
       clearCall(callId);
       acknowledge?.({ ok: true });
+    });
+
+    socket.on('webrtc_signal', (data) => {
+      const { callId, signal } = data || {};
+      if (!callId || !signal) return;
+      const call = activeCalls.get(callId);
+      if (!call || !call.participantIds.includes(authenticatedUserId)) return;
+      const recipientId = call.participantIds.find((id) => id !== authenticatedUserId);
+      if (recipientId) {
+        io.to(`user:${recipientId}`).emit('webrtc_signal', {
+          callId,
+          senderId: authenticatedUserId,
+          signal,
+        });
+      }
     });
 
     // Socket connection is the source of truth for live presence. Do not rely
