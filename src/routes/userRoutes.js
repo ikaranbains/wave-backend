@@ -93,23 +93,26 @@ router.post('/me/avatar', authenticate, receiveAvatar, async (req, res) => {
   let uploadedAvatar;
   try {
     uploadedAvatar = await uploadAvatarBuffer(req.file);
-    const previousUser = await User.findById(req.user.userId).select('avatarPublicId avatarResourceType');
+    const avatarFields = {
+      avatar: uploadedAvatar.secure_url,
+      avatarPublicId: uploadedAvatar.public_id,
+      avatarResourceType: uploadedAvatar.resource_type || 'image',
+    };
+
+    // new: false returns the pre-update document, so one round trip yields both the
+    // write and the old publicId needed to clean up the photo being replaced.
+    const previousUser = await User.findByIdAndUpdate(
+      req.user.userId,
+      { $set: avatarFields },
+      { new: false, runValidators: true }
+    ).select('-passwordHash');
+
     if (!previousUser) {
       await cloudinary.uploader.destroy(uploadedAvatar.public_id, { resource_type: 'image' });
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const user = await User.findByIdAndUpdate(
-      req.user.userId,
-      {
-        $set: {
-          avatar: uploadedAvatar.secure_url,
-          avatarPublicId: uploadedAvatar.public_id,
-          avatarResourceType: uploadedAvatar.resource_type || 'image',
-        },
-      },
-      { new: true, runValidators: true }
-    ).select('-passwordHash');
+    const user = { ...previousUser.toObject(), ...avatarFields };
 
     if (previousUser.avatarPublicId) {
       await cloudinary.uploader

@@ -253,30 +253,36 @@ export async function createAndBroadcastMessage({ io, senderId, data }) {
     return { ok: false, status: 404, error: 'Conversation not found' };
   }
 
-  if (normalizedClientId) {
+  // The unique partial {senderId, clientId} index is already the idempotency guard,
+  // so a retry collides on insert. Letting it collide costs a lookup only on the rare
+  // duplicate, where pre-checking cost one on every message sent.
+  let newMessage;
+  try {
+    newMessage = await Message.create({
+      conversationId,
+      senderId,
+      clientId: normalizedClientId,
+      text: normalizedText,
+      attachment: normalizedAttachment,
+      replyTo: normalizedReplyTo,
+      status: 'sent',
+    });
+  } catch (error) {
+    if (error?.code !== 11000 || !normalizedClientId) throw error;
+
     const existingMessage = await Message.findOne({
       senderId,
       clientId: normalizedClientId,
     });
-    if (existingMessage) {
-      return {
-        ok: true,
-        duplicate: true,
-        messageId: existingMessage._id.toString(),
-        message: existingMessage.toJSON(),
-      };
-    }
-  }
+    if (!existingMessage) throw error;
 
-  const newMessage = await Message.create({
-    conversationId,
-    senderId,
-    clientId: normalizedClientId,
-    text: normalizedText,
-    attachment: normalizedAttachment,
-    replyTo: normalizedReplyTo,
-    status: 'sent',
-  });
+    return {
+      ok: true,
+      duplicate: true,
+      messageId: existingMessage._id.toString(),
+      message: existingMessage.toJSON(),
+    };
+  }
 
   const unreadIncrements = Object.fromEntries(
     conversation.participants

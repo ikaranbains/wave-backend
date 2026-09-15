@@ -38,4 +38,9 @@ const callSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// Call history is find({ participantIds }).sort({ createdAt: -1 }). The caller is
+// always in participantIds, so this one multikey compound index serves the whole
+// query — match and sort — instead of scanning the collection and sorting in memory.
+callSchema.index({ participantIds: 1, createdAt: -1 });
+
 export const Call = mongoose.model('Call', callSchema);

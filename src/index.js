@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import express from 'express';
+import compression from 'compression';
 import cors from 'cors';
 import morgan from 'morgan';
 import mongoose from 'mongoose';
@@ -27,6 +28,7 @@ const httpServer = createServer(app);
 
 // Global Middlewares (cors, morgan HTTP logger, JSON body parser)
 app.set('trust proxy', 1);
+app.use(compression());
 app.use(
   cors({
     origin(origin, callback) {

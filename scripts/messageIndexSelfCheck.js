@@ -16,7 +16,9 @@ import mongoose from 'mongoose';
 dotenv.config();
 
 import { Message } from '../src/models/Message.js';
+import { Conversation } from '../src/models/Conversation.js';
 import { syncModelIndexes } from '../src/config/syncIndexes.js';
+import { createAndBroadcastMessage } from '../src/services/messageService.js';
 
 const conversationId = new mongoose.Types.ObjectId();
 const senderId = new mongoose.Types.ObjectId();
@@ -63,9 +65,30 @@ async function main() {
     await Message.create(newMessage({ clientId: 'outbox-2' }));
     assert.strictEqual(await Message.countDocuments({ conversationId }), 5);
 
+    // 4. createAndBroadcastMessage relies on that duplicate key instead of pre-checking,
+    //    so a replayed clientId must come back as the SAME message, not an error.
+    await Conversation.create({ _id: conversationId, participants: [senderId] });
+    const first = await createAndBroadcastMessage({
+      senderId,
+      data: { conversationId, clientId: 'replay-1', text: 'hello' },
+    });
+    const replay = await createAndBroadcastMessage({
+      senderId,
+      data: { conversationId, clientId: 'replay-1', text: 'hello' },
+    });
+    assert.ok(first.ok && !first.duplicate, 'the first send must create a message');
+    assert.ok(replay.ok && replay.duplicate, 'a replayed clientId must resolve as a duplicate');
+    assert.strictEqual(replay.messageId, first.messageId, 'a replay must return the same message');
+    assert.strictEqual(
+      await Message.countDocuments({ conversationId, clientId: 'replay-1' }),
+      1,
+      'a replay must not insert a second message'
+    );
+
     console.log('✅ message index self-check passed (null clientIds coexist, duplicates rejected)');
   } finally {
     await Message.deleteMany({ conversationId });
+    await Conversation.deleteOne({ _id: conversationId });
     await mongoose.disconnect();
   }
 }
