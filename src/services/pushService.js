@@ -134,7 +134,7 @@ export async function sendPushToUser(userId, payload, options = {}) {
       notification: {
         ...notification,
         icon: icon || '/wave-192.png',
-        badge: badge || '/wave-192.png',
+        badge: badge || '/wave-badge.png',
         tag,
         renotify: Boolean(tag),
         requireInteraction,

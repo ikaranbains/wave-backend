@@ -117,7 +117,7 @@ async function notifyOfflineParticipants({ io, conversation, senderId, message }
           title: sender?.name || 'Wave',
           body: preview.slice(0, 160),
           icon: '/wave-192.png',
-          badge: '/wave-192.png',
+          badge: '/wave-badge.png',
           tag: `conversation-${message.conversationId}`,
           data: {
             conversationId: message.conversationId.toString(),
